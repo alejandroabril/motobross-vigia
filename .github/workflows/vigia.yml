@@ -1,0 +1,88 @@
+# Vigía de Motobross: revisa cada 5 minutos que la app y la tienda respondan.
+# Si se caen, abre un aviso (issue) con la hora y el error -> GitHub manda un
+# correo. Cuando vuelven, lo cierra con cuánto duró la caída.
+name: Vigía de Motobross
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: write
+
+concurrency:
+  group: vigia
+  cancel-in-progress: false
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Revisar los sitios (3 intentos antes de dar por caído)
+        id: rev
+        run: |
+          set +e
+          caidos=""; detalle=""
+          for url in https://app.motobross.shop/ https://motobross.shop/; do
+            ok=0
+            for i in 1 2 3; do
+              res=$(curl -s -o /dev/null -m 20 -w '%{http_code} %{time_total}' "$url")
+              code=${res%% *}; t=${res##* }
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              sleep 20
+            done
+            echo "- $url → $code (${t}s)" >> "$GITHUB_STEP_SUMMARY"
+            if [ $ok = 0 ]; then
+              caidos="$caidos ${url#https://}"
+              case "$code" in
+                000) causa="sin respuesta (no se pudo conectar)";;
+                52*) causa="Cloudflare no logra conectarse con el servidor (error $code)";;
+                5*)  causa="el servidor respondió con error $code";;
+                *)   causa="respuesta inesperada $code";;
+              esac
+              detalle="$detalle"$'\n'"- **${url#https://}**: $causa"
+            fi
+          done
+          echo "caidos=$(echo $caidos | xargs)" >> "$GITHUB_OUTPUT"
+          { echo 'detalle<<FIN'; echo "$detalle"; echo FIN; } >> "$GITHUB_OUTPUT"
+
+      - name: Abrir, actualizar o cerrar el aviso
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R: ${{ github.repository }}
+          CAIDOS: ${{ steps.rev.outputs.caidos }}
+          DETALLE: ${{ steps.rev.outputs.detalle }}
+        run: |
+          ahora=$(TZ=America/Bogota date '+%d/%m/%Y %H:%M')
+          abierto=$(gh issue list -R "$R" --label caida --state open --json number -q '.[0].number')
+          if [ -n "$CAIDOS" ]; then
+            if [ -z "$abierto" ]; then
+              gh label create caida --color B60205 --description 'Sitio caído' -R "$R" 2>/dev/null || true
+              gh issue create -R "$R" --label caida \
+                --title "🔴 Caída: $CAIDOS" \
+                --body "Detectada el **$ahora** (hora de Colombia).$DETALLE
+
+          Se revisó 3 veces seguidas, con 20 segundos entre intentos. Este aviso se cierra solo cuando vuelva, con cuánto duró."
+              exit 1   # la ejecución fallida también avisa por correo
+            else
+              gh issue edit "$abierto" -R "$R" --title "🔴 Caída: $CAIDOS · sigue a las ${ahora#* }"
+            fi
+          elif [ -n "$abierto" ]; then
+            desde=$(gh issue view "$abierto" -R "$R" --json createdAt -q .createdAt)
+            min=$(( ( $(date +%s) - $(date -d "$desde" +%s) ) / 60 ))
+            gh issue close "$abierto" -R "$R" -c "✅ Volvió a funcionar el **$ahora** (hora de Colombia). Estuvo caída unos **$min minutos**."
+          fi
+
+      - name: Mantener vivo el vigilante (GitHub apaga las tareas sin cambios en 60 días)
+        if: always()
+        run: |
+          git init -q . 2>/dev/null; git fetch -q --depth=1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" main 2>/dev/null || exit 0
+          ult=$(git log -1 --format=%ct FETCH_HEAD 2>/dev/null || echo 0)
+          if [ $(( $(date +%s) - ult )) -gt $(( 45 * 86400 )) ]; then
+            git checkout -q FETCH_HEAD
+            git -c user.name='vigia' -c user.email='vigia@users.noreply.github.com' commit -q --allow-empty -m 'vigía: sigue activo'
+            git push -q "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" HEAD:main
+          fi
